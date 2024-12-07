@@ -45,7 +45,7 @@ func parseAndValidateFlags() *Config {
 	searchRegexPattern := flag.String("ss", "", "The regex pattern to search within files (mutually exclusive with -s)")
 	exclusionPath := flag.String("e", "target", "Directory path to exclude from search")
 	module := flag.Int("m", 0, "Override file pattern")
-	parallelism := flag.Int("P", runtime.NumCPU()*10, "Number of parallel workers")
+	parallelism := flag.Int("P", runtime.NumCPU()*10, "10*Number of parallel workers")
 
 	flag.Parse()
 
@@ -114,13 +114,14 @@ func createMatcher(config *Config) func(string) bool {
 
 // printConfig 打印配置信息
 func printConfig(config *Config) {
-	fmt.Printf("Searching in: \t%s\n", config.SearchPath)
-	fmt.Printf("Excluding: \t%s\n", config.ExclusionPath)
-	fmt.Printf("File pattern: \t%s\n", config.FilePattern)
+	fmt.Printf("Searching in: \t\t%s\n", config.SearchPath)
+	fmt.Printf("Max parallelism: \t%d\n", config.Parallelism)
+	fmt.Printf("Excluding: \t\t%s\n", config.ExclusionPath)
+	fmt.Printf("File pattern: \t\t%s\n", config.FilePattern)
 	if config.SearchPattern != "" {
-		fmt.Printf("Search value: \t%s\n\n", config.SearchPattern)
+		fmt.Printf("Search value: \t\t%s\n\n", config.SearchPattern)
 	} else {
-		fmt.Printf("Search regex: \t%s\n\n", config.SearchRegexPattern)
+		fmt.Printf("Search regex: \t\t%s\n\n", config.SearchRegexPattern)
 	}
 }
 
