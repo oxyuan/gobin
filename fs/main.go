@@ -12,87 +12,135 @@ import (
 )
 
 func main() {
-	// 定义和解析命令行参数
-	filePattern := flag.String("f", "prod.yml$", "[file] The file pattern to search for (regex)")
-	searchPattern := flag.String("s", "", "[search] The regex pattern to search within files (required)")
-	exclusionPath := flag.String("e", "target", "[exclusion] Directory path to exclude from search")
-	//parallelism := flag.Int("P", runtime.NumCPU()*10, "[parallel] Number of parallel workers")
-	module := flag.Int("m", 0, "[module] Override file pattern (1 for .java$, 2 for .yml$, 3 for .yaml$, 4 for .xml$)")
+	// 定义命令行参数
+	filePattern, searchPattern, searchPatternSS, exclusionPath, module := parseFlags()
 
-	// 解析命令行参数
-	flag.Parse()
+	// 设置文件匹配模式
+	filePattern = setFilePattern(filePattern, module)
 
-	// 根据 m 参数设置 filePattern
-	switch *module {
-	case 1:
-		*filePattern = `\.java$`
-	case 2:
-		*filePattern = `\.yml$`
-	case 3:
-		*filePattern = `\.yaml$`
-	case 4:
-		*filePattern = `\.xml$`
-	default:
-		// 使用默认值
+	// 确保 -s 和 -ss 参数的互斥性
+	validateSearchPatterns(searchPattern, searchPatternSS)
+
+	// 编译搜索模式
+	var matcher func(string) bool
+	if searchPattern != "" {
+		matcher = func(line string) bool { return strings.Contains(line, searchPattern) }
+	} else {
+		matcher = compileRegexMatcher(searchPatternSS)
+		searchPattern = searchPatternSS
 	}
 
-	// 检查必需参数
-	if *searchPattern == "" {
-		fmt.Println("Error: -s or -search is required")
+	// 获取并验证搜索路径
+	searchPath := getSearchPath()
+
+	// 打印搜索路径、排除路径、文件匹配模式、搜索字符
+	fmt.Printf("Searching in: \t%s\nExcluding: \t%s\nFile pattern: \t%s\nSearch value: \t%s\n\n", searchPath, exclusionPath, filePattern, searchPattern)
+
+	// 执行文件遍历与搜索
+	walkDirectory(searchPath, filePattern, matcher, exclusionPath)
+}
+
+// parseFlags 解析命令行参数
+func parseFlags() (string, string, string, string, int) {
+	filePattern := flag.String("f", "prod.yml$", "[file] The file pattern to search for (regex)")
+	searchPattern := flag.String("s", "", "[search] The string pattern to search within files (mutually exclusive with -ss, required)")
+	searchPatternSS := flag.String("ss", "", "[search-regex] The regex pattern to search within files (mutually exclusive with -s, required)")
+	exclusionPath := flag.String("e", "target", "[exclusion] Directory path to exclude from search")
+	module := flag.Int("m", 0, "[module] Override file pattern (1 for .java$, 2 for .yml$, 3 for .yaml$, 4 for .xml$, 5 for .txt$, 6 for .properties$, 7 for .json$, 8 for .py$, 9 for .php$)")
+
+	flag.Parse()
+
+	return *filePattern, *searchPattern, *searchPatternSS, *exclusionPath, *module
+}
+
+// setFilePattern 根据 -m 参数设置文件匹配模式
+func setFilePattern(filePattern string, module int) string {
+	switch module {
+	case 1:
+		return `\.java$`
+	case 2:
+		return `\.yml$`
+	case 3:
+		return `\.yaml$`
+	case 4:
+		return `\.xml$`
+	case 5:
+		return `\.txt$`
+	case 6:
+		return `\.properties$`
+	case 7:
+		return `\.json$`
+	case 8:
+		return `\.py$`
+	case 9:
+		return `\.php$`
+	}
+	return filePattern
+}
+
+// validateSearchPatterns 检查 -s 和 -ss 参数的互斥性
+func validateSearchPatterns(searchPattern, searchPatternSS string) {
+	if searchPattern == "" && searchPatternSS == "" {
+		fmt.Println("Error: You must provide either -s or -ss argument, but not both.")
 		flag.Usage()
 		os.Exit(1)
 	}
+	if searchPattern != "" && searchPatternSS != "" {
+		fmt.Println("Error: -s and -ss are mutually exclusive. Please provide only one.")
+		flag.Usage()
+		os.Exit(1)
+	}
+}
 
-	// 编译正则表达式
-	regex, err := regexp.Compile(*searchPattern)
+// compileRegexMatcher 编译正则表达式匹配器
+func compileRegexMatcher(searchPatternSS string) func(string) bool {
+	regex, err := regexp.Compile(searchPatternSS)
 	if err != nil {
 		fmt.Printf("Invalid regex pattern: %v\n", err)
-		return
+		os.Exit(1)
 	}
+	return func(line string) bool { return regex.MatchString(line) }
+}
 
-	// 获取查询路径
+// getSearchPath 获取搜索路径并验证
+func getSearchPath() string {
 	searchPath := "."
 	if len(flag.Args()) > 0 {
 		searchPath = flag.Args()[0]
 	}
-
-	// 检查查询路径是否存在
 	if _, err := os.Stat(searchPath); os.IsNotExist(err) {
 		fmt.Printf("Error: search path %s does not exist\n", searchPath)
 		os.Exit(1)
 	}
+	return searchPath
+}
 
+// walkDirectory 遍历目录并进行文件搜索
+func walkDirectory(searchPath, filePattern string, matcher func(string) bool, exclusionPath string) {
 	// 适配路径分隔符
-	*exclusionPath = filepath.FromSlash(*exclusionPath)
+	exclusionPath = filepath.FromSlash(exclusionPath)
 
-	// 用于控制并发度的通道
-	//sem := make(chan struct{}, *parallelism)
-
-	// 使用 WaitGroup 和 goroutine 实现并发
 	var wg sync.WaitGroup
-	err = filepath.Walk(searchPath, func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(searchPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 
 		// 跳过包含排除路径的文件夹
-		if strings.Contains(path, *exclusionPath) {
+		if strings.Contains(path, exclusionPath) {
 			return nil
 		}
 
-		// 检查文件名是否匹配指定的正则表达式模式
-		matched, err := regexp.MatchString(*filePattern, info.Name())
-		if err != nil || !matched || info.IsDir() {
+		// 检查文件名是否匹配指定的模式
+		if matched, _ := regexp.MatchString(filePattern, info.Name()); !matched || info.IsDir() {
 			return nil
 		}
 
-		// 读取并搜索文件内容
-		//sem <- struct{}{} // 占用一个并发槽
+		// 并发处理文件内容搜索
 		wg.Add(1)
 		go func(path string) {
 			defer wg.Done()
-			searchInFile(path, regex)
-			//<-sem // 释放并发槽
+			searchInFile(path, matcher)
 		}(path)
 
 		return nil
@@ -106,8 +154,8 @@ func main() {
 	}
 }
 
-// 搜索文件内容中符合正则表达式的行，并按要求输出
-func searchInFile(path string, regex *regexp.Regexp) {
+// searchInFile 搜索文件内容中符合模式的行
+func searchInFile(path string, matcher func(string) bool) {
 	file, err := os.Open(path)
 	if err != nil {
 		fmt.Printf("Error opening file %s: %v\n", path, err)
@@ -121,8 +169,8 @@ func searchInFile(path string, regex *regexp.Regexp) {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if regex.MatchString(line) {
-			// 按要求格式化输出：路径和搜索结果之间使用 \t 分隔
+		if matcher(line) {
+			// 输出匹配结果
 			fmt.Printf("%s\t\t%s\n", path, line)
 		}
 	}
