@@ -4,10 +4,10 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"github.com/dlclark/regexp2"
 	"log"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -103,12 +103,12 @@ func createMatcher(config *Config) func(string) bool {
 		}
 	}
 
-	regex, err := regexp.Compile(config.SearchRegexPattern)
-	if err != nil {
-		log.Fatalf("Invalid regex pattern: %v\n", err)
-	}
+	regex := regexp2.MustCompile(config.SearchRegexPattern, regexp2.None)
 	return func(line string) bool {
-		return regex.MatchString(line)
+		if match, err := regex.MatchString(line); err == nil {
+			return match
+		}
+		return false
 	}
 }
 
@@ -127,20 +127,21 @@ func printConfig(config *Config) {
 
 // walkDirectory 遍历目录并执行文件内容搜索
 func walkDirectory(config *Config, matcher func(string) bool) {
-	regex, err := regexp.Compile(config.FilePattern)
-	if err != nil {
-		log.Fatalf("Invalid file pattern regex: %v\n", err)
-	}
+	regex := regexp2.MustCompile(config.FilePattern, regexp2.None)
 
 	sem := make(chan struct{}, config.Parallelism)
 	var wg sync.WaitGroup
 
-	err = filepath.WalkDir(config.SearchPath, func(path string, d os.DirEntry, err error) error {
+	err := filepath.WalkDir(config.SearchPath, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 
-		if d.IsDir() || strings.Contains(path, config.ExclusionPath) || !regex.MatchString(d.Name()) {
+		if d.IsDir() || strings.Contains(path, config.ExclusionPath) {
+			return nil
+		}
+
+		if isMatch, err := regex.MatchString(d.Name()); err != nil || !isMatch {
 			return nil
 		}
 
@@ -170,7 +171,8 @@ func searchInFile(path string, matcher func(string) bool) {
 	}
 	defer file.Close()
 
-	path = filepath.ToSlash(path)
+	// filepath.ToSlash(path)
+	path = "./" + strings.ReplaceAll(path, "\\", "/")
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
