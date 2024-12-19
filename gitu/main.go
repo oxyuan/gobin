@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -12,16 +10,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"time"
-)
-
-var printMu sync.Mutex
-
-const (
-	notOnBranchMsg = iota
-	hasUncommittedChangesMsg
-	hasUnpushedCommitsMsg
-	noRemoteUpdatesMsg
 )
 
 type Config struct {
@@ -29,184 +17,148 @@ type Config struct {
 	Parallelism int
 }
 
-type repoStatusStruct struct {
-	notOnBranch        []string
-	uncommittedChanges []string
-	unpushedCommits    []string
-	updatedRepos       []string
-	noUpdates          []string
-}
-
-func parseFlags() *Config {
-	branchName := flag.String("b", "master", "Branch name to check and update")
-	parallelism := flag.Int("p", runtime.NumCPU()*10, "Number of parallel workers")
-
-	flag.Parse()
-
-	return &Config{
-		Branch:      *branchName,
-		Parallelism: *parallelism,
-	}
+type RepoStatus struct {
+	NotOnBranch        []string
+	UncommittedChanges []string
+	UnpushedCommits    []string
+	UpdatedRepos       []string
+	NoUpdates          []string
 }
 
 func main() {
 	config := parseFlags()
-	log.SetFlags(log.LstdFlags)
+	currentDir := getCurrentDir()
 
-	currentDir, err := os.Getwd()
-	if err != nil {
-		log.Fatalf("Failed to get current directory: %v", err)
-	}
-
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, config.Parallelism)
-
-	repoStatus := repoStatusStruct{
-		notOnBranch:        []string{},
-		uncommittedChanges: []string{},
-		unpushedCommits:    []string{},
-		updatedRepos:       []string{},
-		noUpdates:          []string{},
-	}
-
-	var mu sync.Mutex
-
-	err = filepath.Walk(currentDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if info.IsDir() && filepath.Base(path) == ".git" {
-			repoPath := filepath.Dir(path)
-
-			wg.Add(1)
-			sem <- struct{}{}
-			go func(repoPath string) {
-				defer wg.Done()
-				processRepository(repoPath, config.Branch, &repoStatus, &mu)
-				<-sem
-			}(repoPath)
-
-			return filepath.SkipDir
-		}
-
-		return nil
-	})
-
-	wg.Wait()
-
-	if err != nil {
-		log.Printf("Error during directory traversal: %v", err)
-	}
-
+	repoStatus := RepoStatus{}
+	processRepos(currentDir, config, &repoStatus)
 	printResults(config.Branch, repoStatus)
 }
 
-func processRepository(repoPath, branchName string, repoStatus *repoStatusStruct, mu *sync.Mutex) {
+func parseFlags() *Config {
+	branch := flag.String("b", "master", "Branch name to check and update")
+	parallelism := flag.Int("p", runtime.NumCPU()*10, "Parallelism level")
+	flag.Parse()
+	return &Config{*branch, *parallelism}
+}
+
+func getCurrentDir() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		log.Fatalf("Failed to get current directory: %v", err)
+	}
+	return dir
+}
+
+func processRepos(baseDir string, config *Config, repoStatus *RepoStatus) {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, config.Parallelism)
+	var mu sync.Mutex
+
+	err := filepath.Walk(baseDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() && filepath.Base(path) == ".git" {
+			repoPath := filepath.Dir(path)
+			sem <- struct{}{}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				processRepo(repoPath, config.Branch, repoStatus, &mu)
+				<-sem
+			}()
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("Error walking directories: %v", err)
+	}
+	wg.Wait()
+}
+
+func processRepo(repoPath, branch string, repoStatus *RepoStatus, mu *sync.Mutex) {
 	projectName := filepath.Base(repoPath)
 	checks := []struct {
-		fail func(string, string) bool
-		msg  int
+		Check func(string) bool
+		List  *[]string
 	}{
-		{func(p, b string) bool { return notOnBranch(p, b) }, notOnBranchMsg},
-		{hasUncommittedChanges, hasUncommittedChangesMsg},
-		{hasUnpushedCommits, hasUnpushedCommitsMsg},
-		{noRemoteUpdates, noRemoteUpdatesMsg},
+		{notOnBranch(branch), &repoStatus.NotOnBranch},
+		{hasUncommittedChanges(), &repoStatus.UncommittedChanges},
+		{hasUnpushedCommits(), &repoStatus.UnpushedCommits},
+		{noRemoteUpdates(), &repoStatus.NoUpdates},
 	}
 
-	allChecksPassed := true
-
+	allPassed := true
 	for _, check := range checks {
-		if check.fail(repoPath, branchName) {
+		if check.Check(repoPath) {
 			mu.Lock()
-			switch check.msg {
-			case notOnBranchMsg:
-				repoStatus.notOnBranch = append(repoStatus.notOnBranch, projectName)
-			case hasUncommittedChangesMsg:
-				repoStatus.uncommittedChanges = append(repoStatus.uncommittedChanges, projectName)
-			case hasUnpushedCommitsMsg:
-				repoStatus.unpushedCommits = append(repoStatus.unpushedCommits, projectName)
-			case noRemoteUpdatesMsg:
-				repoStatus.noUpdates = append(repoStatus.noUpdates, projectName)
-			}
+			*check.List = append(*check.List, projectName)
 			mu.Unlock()
-			allChecksPassed = false
+			allPassed = false
 		}
 	}
-
-	if allChecksPassed && gitPull(repoPath) {
+	if allPassed && gitPull(repoPath) {
 		mu.Lock()
-		repoStatus.updatedRepos = append(repoStatus.updatedRepos, projectName)
+		repoStatus.UpdatedRepos = append(repoStatus.UpdatedRepos, projectName)
 		mu.Unlock()
 	}
 }
 
-func notOnBranch(repoPath, branchName string) bool {
-	return executeGitCommand(repoPath, "rev-parse", "--abbrev-ref", "HEAD") != branchName
-}
-
-func hasUncommittedChanges(repoPath, branchName string) bool {
-	return executeGitCommand(repoPath, "status", "--porcelain") != ""
-}
-
-func hasUnpushedCommits(repoPath, branchName string) bool {
-	return executeGitCommand(repoPath, "cherry", "-v") != ""
-}
-
-func noRemoteUpdates(repoPath, branchName string) bool {
-	if executeGitCommand(repoPath, "fetch") == "" {
-		return true
+// 动态生成具体的检查函数
+func notOnBranch(branch string) func(repoPath string) bool {
+	return func(repoPath string) bool {
+		return runGitCommand(repoPath, "rev-parse", "--abbrev-ref", "HEAD") != branch
 	}
-	return strings.Contains(executeGitCommand(repoPath, "status", "-uno"), "Your branch is up to date")
+}
+
+func hasUncommittedChanges() func(repoPath string) bool {
+	return func(repoPath string) bool {
+		return runGitCommand(repoPath, "status", "--porcelain") != ""
+	}
+}
+
+func hasUnpushedCommits() func(repoPath string) bool {
+	return func(repoPath string) bool {
+		return runGitCommand(repoPath, "cherry", "-v") != ""
+	}
+}
+
+func noRemoteUpdates() func(repoPath string) bool {
+	return func(repoPath string) bool {
+		return strings.Contains(runGitCommand(repoPath, "status", "-uno"), "up to date")
+	}
 }
 
 func gitPull(repoPath string) bool {
 	projectName := filepath.Base(repoPath)
-
-	cmd := exec.Command("git", "-C", repoPath, "pull")
-	var outBuf, errBuf bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &outBuf, &errBuf
-
-	if err := cmd.Run(); err != nil {
-		log.Printf("Failed to pull repository %s: %v\n%s", repoPath, err, errBuf.String())
+	if out, err := exec.Command("git", "-C", repoPath, "pull").CombinedOutput(); err != nil {
+		log.Printf("Failed to pull %s: %v", projectName, err)
 		return false
+	} else {
+		log.Printf("Pulled %s:\n%s", projectName, out)
+		return true
 	}
-
-	printMu.Lock()
-	defer printMu.Unlock()
-
-	fmt.Printf("-------------------------------------------- [ git pull: %s ] --------------------------------------------\n", projectName)
-	fmt.Print(outBuf.String())
-
-	return true
 }
 
-func executeGitCommand(repoPath string, args ...string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", repoPath}, args...)...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	output, err := cmd.Output()
-	if err != nil {
-		log.Printf("Git command failed: %s\n%s", cmd.String(), stderr.String())
-		return ""
+func runGitCommand(repoPath string, args ...string) string {
+	cmd := exec.Command("git", append([]string{"-C", repoPath}, args...)...)
+	if out, err := cmd.Output(); err == nil {
+		return strings.TrimSpace(string(out))
 	}
-
-	return strings.TrimSpace(string(output))
+	return ""
 }
 
-func printResults(branchName string, status repoStatusStruct) {
-	printList("Repositories not on branch "+branchName+", skipping:", status.notOnBranch)
-	printList("Repositories with uncommitted changes, skipping:", status.uncommittedChanges)
-	printList("Repositories with unpushed commits, skipping:", status.unpushedCommits)
-	printList("Repositories with no updates remotely, skipping:", status.noUpdates)
-	printList("Repositories successfully updated:", status.updatedRepos)
+func printResults(branch string, repoStatus RepoStatus) {
+	printList("Repositories not on branch "+branch, repoStatus.NotOnBranch)
+	printList("Repositories with uncommitted changes", repoStatus.UncommittedChanges)
+	printList("Repositories with unpushed commits", repoStatus.UnpushedCommits)
+	printList("Repositories with no remote updates", repoStatus.NoUpdates)
+	printList("Repositories updated", repoStatus.UpdatedRepos)
 }
 
 func printList(header string, items []string) {
 	if len(items) > 0 {
-		fmt.Printf("\n%s\n- %s\n", header, strings.Join(items, ", "))
+		fmt.Printf("\n%s:\n%s\n", header, strings.Join(items, ", "))
 	}
 }
