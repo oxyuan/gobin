@@ -1,6 +1,8 @@
 /fs/a/
 /fs/b/
 /fs/target/
+/dist/
+/arthas_docs_md/
 
 .idea/
 .DS_Store
